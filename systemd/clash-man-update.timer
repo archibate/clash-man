@@ -1,0 +1,10 @@
+[Unit]
+Description=Hourly check whether the Clash subscription is due for an update
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

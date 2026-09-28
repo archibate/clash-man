@@ -1,0 +1,6 @@
+[Unit]
+Description=Update the Clash subscription and hot-reload the core
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/clash-man update
