@@ -198,7 +198,11 @@ pub fn render(
         PROVIDER.into(),
         value(json!({
             "type": "file", "path": provider_path,
-            "health-check": {"enable": true, "url": policy.test_url,
+            // Let groups register URL-specific periodic checks. Legacy Meta stores
+            // provider-default checks separately from manual/group delay checks;
+            // a stale manual result otherwise shadows automatic health forever.
+            // An empty default avoids both that split and duplicate network probes.
+            "health-check": {"enable": true, "url": "",
                              "interval": policy.interval_seconds, "lazy": false}
         })),
     );
@@ -248,6 +252,14 @@ pub fn render(
         group.insert("proxies".into(), value(json!(retained)));
         group.insert("use".into(), value(json!([PROVIDER])));
         group.insert("filter".into(), exact_filter(&included).into());
+        // One health authority for every managed node, including select groups
+        // that carry subscription URLs. Legacy Meta takes the shared cadence
+        // from the first registered group and caps distinct extra URLs.
+        group.insert("url".into(), policy.test_url.clone().into());
+        group.insert("interval".into(), value(json!(policy.interval_seconds)));
+        // The first group also supplies the shared HTTP status predicate.
+        // Match Auto's reachability check, not a subscription's old endpoint.
+        group.remove("expected-status");
     }
     groups.insert(
         target + 1,
@@ -367,6 +379,10 @@ mod tests {
             config["proxy-providers"][PROVIDER]["health-check"]["lazy"],
             false
         );
+        assert_eq!(
+            config["proxy-providers"][PROVIDER]["health-check"]["url"],
+            ""
+        );
     }
 
     #[test]
@@ -376,6 +392,23 @@ mod tests {
         let output = render(SOURCE, Some(&policy), Path::new("nodes.yaml")).unwrap();
         let nodes = mapping(output.provider.as_ref().unwrap()).unwrap();
         assert_eq!(nodes["proxies"].as_sequence().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn shared_health_interval_does_not_depend_on_group_registration_order() {
+        let source = SOURCE.replace(
+            "proxy-groups:\n",
+            "proxy-groups:\n  - {name: First, type: select, proxies: ['US.01'], url: 'https://example.org/check', interval: 3600, expected-status: 204}\n",
+        );
+        let output = render(&source, Some(&policy()), Path::new("nodes.yaml")).unwrap();
+        let config = mapping(&output.config).unwrap();
+        for group in config["proxy-groups"].as_sequence().unwrap() {
+            if group.get("use").is_some() {
+                assert_eq!(group["interval"], 30);
+                assert_eq!(group["url"], DEFAULT_TEST_URL);
+                assert!(group.get("expected-status").is_none());
+            }
+        }
     }
 
     #[test]

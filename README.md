@@ -74,8 +74,14 @@ the automatic group's current node and health measurements.
 
 The core checks a shared file provider every 30 seconds, including while idle; the dashboard
 does not need to stay open. `--test-url` defaults to `https://www.gstatic.com/generate_204`.
+Groups register URL-specific checks with that provider; its default URL stays empty so old
+Meta cores cannot let stale manual-test results override periodic health. Converted groups share
+the policy URL, interval, and reachability criterion (any HTTP status), avoiding duplicate probes
+and registration-order dependence. On those cores,
+the node's global `alive` flag is not authoritative; use its URL-specific `extra` results.
 Detection takes a check interval plus probe time; active connections are not transparently
 retried, and an outage affecting all candidates still requires recovery upstream.
+Use a representative destination with `--test-url` when availability differs by site.
 
 Beside the canonical `config.yaml`, the manager creates a private `config.yaml.clash-man/`
 directory containing `routing.json`, `source.yaml`, `nodes.yaml`, and an ignore-all `.gitignore`.

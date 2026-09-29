@@ -62,11 +62,12 @@ class Tunnel(socketserver.BaseRequestHandler):
 
 class Proxy(socketserver.ThreadingTCPServer):
     daemon_threads = True
+    allow_reuse_address = True
 
-    def __init__(self, origin):
+    def __init__(self, origin, listen_port=0):
         self.origin = origin
         self.failed = threading.Event()
-        super().__init__(("127.0.0.1", 0), Tunnel)
+        super().__init__(("127.0.0.1", listen_port), Tunnel)
         threading.Thread(target=self.serve_forever, daemon=True).start()
 
     def fail(self):
@@ -149,6 +150,14 @@ def main():
                     ],
                     "proxy-groups": [
                         {
+                            "name": "Regional first",
+                            "type": "fallback",
+                            "proxies": ["backup"],
+                            "url": health_url + "?regional=1",
+                            "interval": 3600,
+                            "expected-status": "200",
+                        },
+                        {
                             "name": "Proxy",
                             "type": "select",
                             "proxies": ["pri`mary", "backup"],
@@ -226,18 +235,21 @@ def main():
 
             def histories():
                 proxies = api("/providers/proxies/clash-man-nodes")["proxies"]
+                # Legacy Meta's global alive flag describes a different health
+                # store. The automatic group consumes URL-specific results.
+                histories = [node.get("extra", {}).get(health_url, []) for node in proxies]
                 return (
-                    proxies
-                    if all(node["alive"] and node["history"] for node in proxies)
+                    histories
+                    if all(history and history[-1]["delay"] > 0 for history in histories)
                     else None
                 )
 
             first = eventually(histories)
-            previous = first[0]["history"][-1]["time"]
+            previous = first[0][-1]["time"]
             eventually(
                 lambda: (
                     (nodes := histories())
-                    and nodes[0]["history"][-1]["time"] != previous
+                    and nodes[0][-1]["time"] != previous
                 ),
                 seconds=12,
             )
@@ -249,6 +261,14 @@ def main():
             except urllib.error.HTTPError as error:
                 assert error.code == 400
             print("PASS: legacy manual switch cannot replace Auto", flush=True)
+            primary_delay = (
+                "/proxies/"
+                + urllib.parse.quote("pri`mary", safe="")
+                + "/delay?"
+                + urllib.parse.urlencode({"timeout": 3000, "url": health_url})
+            )
+            api(primary_delay)
+            primary_port = primary.server_address[1]
             primary.fail()
             started = time.monotonic()
             eventually(lambda: api(group_path)["now"] == "backup", seconds=20)
@@ -278,6 +298,17 @@ def main():
                 check=True,
             )
             assert request.stdout == "204"
+            try:
+                api(primary_delay)
+                raise AssertionError("failed primary unexpectedly passed manual test")
+            except urllib.error.HTTPError as error:
+                assert error.code in (503, 504)
+            primary = Proxy(origin.server_address, primary_port)
+            eventually(lambda: api(group_path)["now"] == "pri`mary", seconds=20)
+            print(
+                "PASS: periodic health replaces stale successful and failed manual tests",
+                flush=True,
+            )
             subprocess.run(command + ["--disable"], env=environment, check=True)
             assert api("/proxies/Proxy")["all"] == ["pri`mary", "backup"]
             print(
