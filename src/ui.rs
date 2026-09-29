@@ -445,14 +445,19 @@ fn render_logs(frame: &mut Frame<'_>, app: &App, area: Rect) {
         );
         return;
     }
-    let (start, end) = window(logs.len(), app.log_index, area.height.saturating_sub(2));
+    let selected = if app.log_follow {
+        logs.len().saturating_sub(1)
+    } else {
+        app.log_index
+    };
+    let (start, end) = window(logs.len(), selected, area.height.saturating_sub(2));
     let rows = (start..end).map(|index| {
         let log = logs[index];
         Row::new([
             Cell::from(log.level.clone()).style(Style::new().fg(level_color(&log.level))),
             Cell::from(log.payload.clone()),
         ])
-        .style(row_style(index == app.log_index, !app.log_follow))
+        .style(row_style(index == selected, !app.log_follow))
     });
     frame.render_widget(
         Table::new(rows, [Constraint::Length(7), Constraint::Fill(1)])

@@ -6,6 +6,7 @@ use clash_man::{
     app::{ApiEvent, App, Command, InputOutcome},
     config::{Cli, CliCommand, ControllerSettings},
     model::{LogEntry, MemorySample, TrafficSample},
+    routing::AutoPolicy,
     subscription::{self, Outcome, SubscriptionError, SubscriptionSettings},
     ui,
 };
@@ -28,8 +29,42 @@ async fn main() -> Result<()> {
         .wrap_err("subscription configuration failed")?;
     let client = ControllerClient::new(&settings).wrap_err("controller client setup failed")?;
 
-    if let Some(CliCommand::Update { force }) = cli.command {
-        return run_update(&subscription, &client, force).await;
+    match cli.command {
+        Some(CliCommand::Recover) => {
+            subscription::recover(&subscription, &client).await?;
+            return Ok(());
+        }
+        Some(CliCommand::Update { force }) => {
+            return run_update(&subscription, &client, force).await;
+        }
+        Some(CliCommand::Auto {
+            group,
+            preferred,
+            interval,
+            test_url,
+            disable,
+        }) => {
+            let policy = AutoPolicy {
+                enabled: !disable,
+                group: group.clone(),
+                preferred,
+                interval_seconds: interval.as_secs(),
+                test_url,
+            };
+            subscription::configure_auto(&subscription, &client, policy)
+                .await
+                .wrap_err("automatic routing configuration failed")?;
+            if disable {
+                println!("Automatic routing disabled; subscription groups restored");
+            } else {
+                println!(
+                    "Automatic failover enabled for {group}; native health checks every {}s",
+                    interval.as_secs()
+                );
+            }
+            return Ok(());
+        }
+        None => {}
     }
 
     let mut app = App::new(settings.group_test_urls.clone());
@@ -72,25 +107,34 @@ async fn run(
 ) -> Result<()> {
     let (event_tx, mut event_rx) = mpsc::channel(256);
     let mut tasks = JoinSet::new();
-    spawn_background_tasks(&mut tasks, client.clone(), event_tx.clone());
-    tasks.spawn(subscription_scheduler(
-        client.clone(),
-        subscription.clone(),
-        event_tx.clone(),
-    ));
+    let mut background = JoinSet::new();
+    spawn_background_tasks(&mut background, client.clone(), event_tx.clone());
+    let mut subscription_tick = interval(Duration::from_secs(300));
+    subscription_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     let mut input = EventStream::new();
     let mut redraw = interval(Duration::from_millis(100));
     redraw.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+    let result: Result<()> = async {
     loop {
         tokio::select! {
+            joined = tasks.join_next(), if !tasks.is_empty() => {
+                if let Some(Err(error)) = joined { app.apply(ApiEvent::Status(Err(format!("task failed: {error}")))); }
+            }
+            _ = subscription_tick.tick(), if tasks.len() < 32 => {
+                let (client, subscription, sender) = (client.clone(), subscription.clone(), event_tx.clone());
+                tasks.spawn(async move {
+                    let result = subscription::update(&subscription, &client, false).await;
+                    report_subscription(&client, &subscription, &sender, result, true).await;
+                });
+            }
             _ = redraw.tick() => {
                 terminal.draw(|frame| ui::render(frame, &app))?;
             }
             Some(api_event) = event_rx.recv() => {
                 if let Some(command) = app.apply(api_event) {
-                    spawn_command(&mut tasks, client.clone(), subscription.clone(), event_tx.clone(), command);
+                    spawn_command(&mut tasks, &mut app, client.clone(), subscription.clone(), event_tx.clone(), command);
                 }
             }
             maybe_event = input.next() => match maybe_event {
@@ -101,7 +145,7 @@ async fn run(
                     match app.handle_key(key) {
                         InputOutcome::Continue => {}
                         InputOutcome::Quit => break,
-                        InputOutcome::Run(command) => spawn_command(&mut tasks, client.clone(), subscription.clone(), event_tx.clone(), command),
+                        InputOutcome::Run(command) => spawn_command(&mut tasks, &mut app, client.clone(), subscription.clone(), event_tx.clone(), command),
                     }
                 }
                 Some(Ok(Event::Resize(_, _))) => {
@@ -116,8 +160,31 @@ async fn run(
         }
     }
 
-    tasks.abort_all();
-    while tasks.join_next().await.is_some() {}
+    Ok(())
+    }.await;
+    // Stop readers and reject queued sends, but let transactions reach commit/rollback.
+    event_rx.close();
+    background.abort_all();
+    while background.join_next().await.is_some() {}
+    let mut cleanup_error = None;
+    while let Some(joined) = tasks.join_next().await {
+        if let Err(error) = joined {
+            cleanup_error = Some(error);
+        }
+    }
+    subscription::recover(&subscription, &client)
+        .await
+        .or_else(|error| {
+            if matches!(error, SubscriptionError::Busy) {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        })?;
+    result?;
+    if let Some(error) = cleanup_error {
+        return Err(error.into());
+    }
     Ok(())
 }
 
@@ -154,23 +221,6 @@ async fn snapshot_poller(client: ControllerClient, sender: mpsc::Sender<ApiEvent
             .await
             .is_err()
         {
-            break;
-        }
-    }
-}
-
-/// Updates the subscription whenever it is due while the dashboard is open.
-async fn subscription_scheduler(
-    client: ControllerClient,
-    settings: SubscriptionSettings,
-    sender: mpsc::Sender<ApiEvent>,
-) {
-    let mut ticker = interval(Duration::from_secs(300));
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    loop {
-        ticker.tick().await;
-        let result = subscription::update(&settings, &client, false).await;
-        if !report_subscription(&client, &settings, &sender, result, true).await {
             break;
         }
     }
@@ -337,12 +387,37 @@ async fn reconnecting_stream<T, Factory, Fut, Map>(
 
 fn spawn_command(
     tasks: &mut JoinSet<()>,
+    app: &mut App,
     client: ControllerClient,
     subscription: SubscriptionSettings,
     sender: mpsc::Sender<ApiEvent>,
     command: Command,
 ) {
+    if tasks.len() >= 32 {
+        match &command {
+            Command::TestGroup { group, .. } => {
+                app.testing.remove(group);
+            }
+            Command::UpdateSubscription => {
+                app.subscription_busy = false;
+            }
+            _ => {}
+        }
+        app.apply(ApiEvent::Status(Err("too many commands in flight".into())));
+        return;
+    }
     tasks.spawn(async move {
+        let _guard = if matches!(command, Command::SelectProxy { .. } | Command::SetMode(_)) {
+            match subscription::configuration_lock(&subscription) {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    let _ = sender.send(ApiEvent::Status(Err(error.to_string()))).await;
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         match command {
             Command::RefreshAll => {
                 let (version, proxies, connections, rules, config) = tokio::join!(
@@ -442,3 +517,58 @@ async fn send_config(client: &ControllerClient, sender: &mpsc::Sender<ApiEvent>)
 
 // Keep stream payload types visible to rustdoc and prevent accidental contract drift.
 const _: fn(TrafficSample, MemorySample, LogEntry) = |_, _, _| {};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rejecting_saturated_commands_clears_busy_indicators() {
+        let mut tasks = JoinSet::new();
+        for _ in 0..32 {
+            tasks.spawn(std::future::pending::<()>());
+        }
+        let mut app = App::new(Default::default());
+        app.subscription_busy = true;
+        app.testing.insert("Proxy".into());
+        let client = ControllerClient::new(&ControllerSettings {
+            base_url: "http://127.0.0.1:1".parse().unwrap(),
+            secret: String::new(),
+            config_path: None,
+            group_test_urls: Default::default(),
+        })
+        .unwrap();
+        let subscription = SubscriptionSettings {
+            config_path: "unused".into(),
+            link_file: "unused".into(),
+            state_dir: "unused".into(),
+            interval: Duration::from_secs(1),
+        };
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(ApiEvent::Status(Ok("full".into()))).unwrap();
+        spawn_command(
+            &mut tasks,
+            &mut app,
+            client.clone(),
+            subscription.clone(),
+            tx.clone(),
+            Command::UpdateSubscription,
+        );
+        spawn_command(
+            &mut tasks,
+            &mut app,
+            client,
+            subscription,
+            tx,
+            Command::TestGroup {
+                group: "Proxy".into(),
+                url: "http://unused".into(),
+            },
+        );
+        assert!(!app.subscription_busy);
+        assert!(!app.testing.contains("Proxy"));
+        assert_eq!(tasks.len(), 32);
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+    }
+}

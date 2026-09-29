@@ -20,7 +20,8 @@ const RELOAD_TIMEOUT: Duration = Duration::from_secs(60);
 const DELAY_TEST_MS: u64 = 5_000;
 /// The core tests a group's nodes concurrently, so one budget plus slack covers the call.
 const GROUP_DELAY_TIMEOUT: Duration = Duration::from_millis(DELAY_TEST_MS + 5_000);
-const MAX_STREAM_LINE: usize = 1024 * 1024;
+const MAX_STREAM_LINE: usize = 64 * 1024;
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum ApiError {
@@ -34,8 +35,10 @@ pub enum ApiError {
     Transport(String),
     #[error("invalid controller response: {0}")]
     Decode(String),
-    #[error("controller stream line exceeded 1 MiB")]
+    #[error("controller stream line exceeded 64 KiB")]
     StreamTooLarge,
+    #[error("response exceeds configured byte limit")]
+    ResponseTooLarge,
     #[error("event receiver closed")]
     ReceiverClosed,
 }
@@ -136,8 +139,10 @@ impl ControllerClient {
             .await
             .map_err(transport_error)?;
         if response.status() == StatusCode::BAD_REQUEST {
-            let body = response.text().await.unwrap_or_default();
-            return Err(ApiError::Rejected(controller_message(&body)));
+            let body = bounded_body(response, 64 * 1024).await?;
+            return Err(ApiError::Rejected(controller_message(
+                &String::from_utf8_lossy(&body),
+            )));
         }
         validate_status(response)?;
         Ok(())
@@ -167,7 +172,8 @@ impl ControllerClient {
             .await
             .map_err(transport_error)?;
         let response = validate_status(response)?;
-        response.json().await.map_err(decode_error)
+        let body = bounded_body(response, MAX_RESPONSE_BYTES).await?;
+        serde_json::from_slice(&body).map_err(decode_error)
     }
 
     async fn empty_request<T: Serialize + ?Sized>(
@@ -189,32 +195,39 @@ impl ControllerClient {
         T: DeserializeOwned + Send + 'static,
     {
         let url = self.endpoint(path)?;
-        let response = self
-            .authorized(self.http.get(url))
-            .send()
-            .await
-            .map_err(transport_error)?;
+        let response =
+            tokio::time::timeout(REQUEST_TIMEOUT, self.authorized(self.http.get(url)).send())
+                .await
+                .map_err(|_| ApiError::Transport("stream connection timed out".into()))?
+                .map_err(transport_error)?;
         let mut response = validate_status(response)?;
         let mut buffer = Vec::new();
-
-        while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
-            buffer.extend_from_slice(&chunk);
-            while let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
-                let line = buffer.drain(..=position).collect::<Vec<_>>();
-                let text = std::str::from_utf8(&line)
-                    .map_err(|error| ApiError::Decode(error.to_string()))?
-                    .trim();
-                if text.is_empty() {
+        let quiet_logs = path.starts_with("logs?");
+        let idle = Duration::from_secs(if quiet_logs { 90 } else { 15 });
+        loop {
+            let chunk = match tokio::time::timeout(idle, response.chunk()).await {
+                Ok(result) => result.map_err(transport_error)?,
+                Err(_) if quiet_logs => return Ok(()),
+                Err(_) => return Err(ApiError::Transport("stream idle timeout".into())),
+            };
+            let Some(chunk) = chunk else { break };
+            for part in chunk.split_inclusive(|byte| *byte == b'\n') {
+                if buffer.len().saturating_add(part.len()) > MAX_STREAM_LINE {
+                    return Err(ApiError::StreamTooLarge);
+                }
+                buffer.extend_from_slice(part);
+                if part.last() != Some(&b'\n') {
                     continue;
                 }
-                let value = serde_json::from_str(text).map_err(decode_error)?;
-                sender
-                    .send(value)
-                    .await
-                    .map_err(|_| ApiError::ReceiverClosed)?;
-            }
-            if buffer.len() > MAX_STREAM_LINE {
-                return Err(ApiError::StreamTooLarge);
+                let text = std::str::from_utf8(&buffer).map_err(decode_error)?.trim();
+                if !text.is_empty() {
+                    let value = serde_json::from_str(text).map_err(decode_error)?;
+                    sender
+                        .send(value)
+                        .await
+                        .map_err(|_| ApiError::ReceiverClosed)?;
+                }
+                buffer.clear();
             }
         }
         Err(ApiError::Transport("controller stream ended".into()))
@@ -241,6 +254,26 @@ impl ControllerClient {
             .extend([resource, name]);
         Ok(url)
     }
+}
+
+pub(crate) async fn bounded_body(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> ApiResult<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(ApiError::ResponseTooLarge);
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err(ApiError::ResponseTooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 fn validate_status(response: reqwest::Response) -> ApiResult<reqwest::Response> {
@@ -270,7 +303,9 @@ fn decode_error(error: impl std::fmt::Display) -> ApiError {
 
 #[cfg(test)]
 mod tests {
+    use super::{MAX_RESPONSE_BYTES, MAX_STREAM_LINE};
     use std::{collections::BTreeMap, sync::Arc};
+    use tokio::sync::mpsc;
 
     use axum::{
         Json, Router,
@@ -306,6 +341,49 @@ mod tests {
             group_test_urls: BTreeMap::new(),
         })
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rejects_complete_oversized_stream_lines_before_delivery() {
+        let router = Router::new().route(
+            "/logs",
+            get(|| async {
+                let line = format!(
+                    "{{\"type\":\"info\",\"payload\":\"{}\"}}\n",
+                    "x".repeat(MAX_STREAM_LINE)
+                );
+                let parts = vec![
+                    Ok::<_, std::io::Error>(line[..MAX_STREAM_LINE - 16].to_owned()),
+                    Ok(line[MAX_STREAM_LINE - 16..].to_owned()),
+                ];
+                Response::new(Body::from_stream(futures_util::stream::iter(parts)))
+            }),
+        );
+        let client = client(mock_server(router).await, "");
+        let (tx, mut rx) = mpsc::channel(4);
+        assert!(matches!(
+            client.stream_logs(tx).await,
+            Err(ApiError::StreamTooLarge)
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn bounds_chunked_responses_without_content_length() {
+        let router = Router::new().route(
+            "/version",
+            get(|| async {
+                Response::new(Body::from_stream(futures_util::stream::iter([
+                    Ok::<_, std::io::Error>(vec![b' '; MAX_RESPONSE_BYTES]),
+                    Ok(vec![b' '; 1]),
+                ])))
+            }),
+        );
+        let client = client(mock_server(router).await, "");
+        assert!(matches!(
+            client.version().await,
+            Err(ApiError::ResponseTooLarge)
+        ));
     }
 
     #[tokio::test]

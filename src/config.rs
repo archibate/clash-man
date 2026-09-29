@@ -47,6 +47,26 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum CliCommand {
+    /// Roll back an interrupted update without fetching a subscription.
+    Recover,
+    /// Configure native automatic failover (continues when this dashboard is closed).
+    Auto {
+        /// Routing group to manage.
+        #[arg(long, default_value = "Proxy")]
+        group: String,
+        /// Preferred node, in priority order; repeat this option for backups.
+        #[arg(long = "prefer")]
+        preferred: Vec<String>,
+        /// Active health-check interval (5s to 1d).
+        #[arg(long, default_value = "30s", value_parser = parse_interval)]
+        interval: Duration,
+        /// URL used by the core to test node health.
+        #[arg(long, default_value = crate::routing::DEFAULT_TEST_URL)]
+        test_url: String,
+        /// Restore the subscription's manual routing groups.
+        #[arg(long)]
+        disable: bool,
+    },
     /// Download the subscription, validate it, replace the config and hot-reload the core.
     Update {
         /// Update even if the last success is younger than --update-interval.
@@ -109,7 +129,8 @@ struct ProxyGroupConfig {
 
 impl ControllerSettings {
     pub fn resolve(cli: &Cli) -> Result<Self, ConfigError> {
-        let config_path = discover_config(cli.config.as_deref());
+        let config_path = discover_config(cli.config.as_deref())
+            .map(|path| fs::canonicalize(&path).unwrap_or(path));
         let file_config = config_path
             .as_deref()
             .filter(|path| path.is_file())
@@ -192,15 +213,18 @@ fn parse_interval(raw: &str) -> Result<Duration, String> {
         "d" => 86_400,
         _ => return Err(format!("unknown unit {unit:?}; use s, m, h or d")),
     };
-    Ok(Duration::from_secs(amount * seconds))
+    let seconds = amount.checked_mul(seconds).ok_or("interval is too large")?;
+    Ok(Duration::from_secs(seconds))
 }
 
 fn read_clash_config(path: &Path) -> Result<ClashConfig, ConfigError> {
-    let text = fs::read_to_string(path).map_err(|source| ConfigError::Read {
-        path: path.to_owned(),
-        source,
-    })?;
-    serde_yaml_ng::from_str(&text).map_err(|source| ConfigError::Parse {
+    let bytes = crate::subscription::recovery_config(path)
+        .and_then(|old| old.map_or_else(|| fs::read(path), Ok))
+        .map_err(|source| ConfigError::Read {
+            path: path.to_owned(),
+            source,
+        })?;
+    serde_yaml_ng::from_slice(&bytes).map_err(|source| ConfigError::Parse {
         path: path.to_owned(),
         source,
     })

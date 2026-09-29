@@ -15,6 +15,8 @@ use crate::{
 
 const HISTORY_LIMIT: usize = 120;
 const LOG_LIMIT: usize = 2_000;
+const LOG_BYTE_LIMIT: usize = 4 * 1024 * 1024;
+const LOG_ENTRY_LIMIT: usize = 16 * 1024;
 const PAGE_STEP: isize = 10;
 const STATUS_LIFETIME: Duration = Duration::from_secs(5);
 const ERROR_LIFETIME: Duration = Duration::from_secs(15);
@@ -203,6 +205,7 @@ pub struct App {
     pub traffic: VecDeque<TrafficSample>,
     pub memory: VecDeque<MemorySample>,
     pub logs: VecDeque<LogEntry>,
+    log_bytes: usize,
     pub connected: bool,
     pub status: String,
     pub status_error: bool,
@@ -248,6 +251,7 @@ impl App {
             traffic: VecDeque::with_capacity(HISTORY_LIMIT),
             memory: VecDeque::with_capacity(HISTORY_LIMIT),
             logs: VecDeque::with_capacity(LOG_LIMIT),
+            log_bytes: 0,
             connected: false,
             status: "Connecting to controller…".into(),
             status_error: false,
@@ -312,10 +316,32 @@ impl App {
             }
             ApiEvent::Traffic(value) => push_bounded(&mut self.traffic, value, HISTORY_LIMIT),
             ApiEvent::Memory(value) => push_bounded(&mut self.memory, value, HISTORY_LIMIT),
-            ApiEvent::Log(value) => {
-                push_bounded(&mut self.logs, value, LOG_LIMIT);
-                if self.log_follow {
-                    self.log_index = self.logs().len().saturating_sub(1);
+            ApiEvent::Log(mut value) => {
+                if value.payload.len() > LOG_ENTRY_LIMIT {
+                    let mut end = LOG_ENTRY_LIMIT;
+                    while !value.payload.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    value.payload.truncate(end);
+                }
+                if value.time.len() > 128 {
+                    value.time = String::new();
+                }
+                if value.level.len() > 32 {
+                    value.level = "unknown".into();
+                }
+                value.payload.shrink_to_fit();
+                value.level.shrink_to_fit();
+                value.time.shrink_to_fit();
+                self.log_bytes +=
+                    value.payload.capacity() + value.level.capacity() + value.time.capacity();
+                self.logs.push_back(value);
+                while self.logs.len() > LOG_LIMIT || self.log_bytes > LOG_BYTE_LIMIT {
+                    if let Some(old) = self.logs.pop_front() {
+                        self.log_bytes -=
+                            old.payload.capacity() + old.level.capacity() + old.time.capacity();
+                        self.log_index = self.log_index.saturating_sub(1);
+                    }
                 }
             }
             ApiEvent::Status(Ok(message)) => self.set_status(message),
@@ -464,6 +490,7 @@ impl App {
             }
             (Page::Logs, KeyCode::Char('c')) => {
                 self.logs.clear();
+                self.log_bytes = 0;
                 self.log_index = 0;
                 self.log_follow = true;
                 None
@@ -702,6 +729,9 @@ impl App {
             (Page::Rules, _) => self.rules().len(),
             (Page::Logs, _) => self.logs().len(),
         };
+        if self.page == Page::Logs && self.log_follow {
+            self.log_index = length.saturating_sub(1);
+        }
         let index = match (self.page, self.pane) {
             (Page::Proxies, Pane::Groups) => &mut self.group_index,
             (Page::Proxies, Pane::Nodes) => &mut self.node_index,
@@ -865,6 +895,8 @@ fn moved_index(index: usize, length: usize, delta: isize, wrap: bool) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use super::{LOG_BYTE_LIMIT, LOG_ENTRY_LIMIT, LOG_LIMIT};
+    use crate::model::LogEntry;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::{ApiEvent, App, Command, InputOutcome, Page, Pane, moved_index};
@@ -909,6 +941,46 @@ mod tests {
         let mut app = App::new(Default::default());
         let command = app.apply(ApiEvent::Proxies(Ok(sample_proxies())));
         (app, command)
+    }
+
+    #[test]
+    fn scrolling_from_live_logs_starts_at_the_displayed_tail() {
+        let mut app = App::new(Default::default());
+        app.page = Page::Logs;
+        for _ in 0..10 {
+            app.apply(ApiEvent::Log(LogEntry::default()));
+        }
+        app.move_cursor(-1, false);
+        assert_eq!(app.log_index, 8);
+        assert!(!app.log_follow);
+    }
+
+    #[test]
+    fn log_retention_has_a_byte_budget_and_preserves_unicode() {
+        let mut app = App::new(Default::default());
+        for _ in 0..1000 {
+            app.apply(ApiEvent::Log(LogEntry {
+                time: "t".repeat(63_000),
+                level: "info".into(),
+                payload: "中".repeat(10_000),
+            }));
+        }
+        assert!(app.log_bytes <= LOG_BYTE_LIMIT);
+        assert!(app.logs.len() < LOG_LIMIT);
+        assert!(
+            app.logs
+                .iter()
+                .all(|entry| entry.payload.len() <= LOG_ENTRY_LIMIT)
+        );
+        assert_eq!(
+            app.log_bytes,
+            app.logs
+                .iter()
+                .map(|entry| entry.payload.capacity()
+                    + entry.level.capacity()
+                    + entry.time.capacity())
+                .sum::<usize>()
+        );
     }
 
     #[test]
