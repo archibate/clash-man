@@ -1,10 +1,12 @@
 use std::{
     fmt, fs,
     io::Write,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
@@ -151,12 +153,7 @@ fn save_pending(
 fn clear_pending(settings: &SubscriptionSettings) -> Result<(), SubscriptionError> {
     let path = settings.state_dir.join("pending.json");
     fs::remove_file(&path).map_err(|source| SubscriptionError::Write { path, source })?;
-    fs::File::open(&settings.state_dir)
-        .and_then(|file| file.sync_all())
-        .map_err(|source| SubscriptionError::Write {
-            path: settings.state_dir.clone(),
-            source,
-        })
+    sync_dir(&settings.state_dir)
 }
 
 async fn rollback_update(
@@ -173,12 +170,7 @@ async fn rollback_update(
                 source,
             })?;
             if let Some(parent) = path.parent() {
-                fs::File::open(parent)
-                    .and_then(|directory| directory.sync_all())
-                    .map_err(|source| SubscriptionError::Write {
-                        path: parent.to_owned(),
-                        source,
-                    })?;
+                sync_dir(parent)?;
             }
         }
     }
@@ -740,6 +732,7 @@ fn config_state_dir(path: &Path) -> std::io::Result<PathBuf> {
 
 fn prepare_state(path: &Path) -> Result<(), SubscriptionError> {
     create_dir(path)?;
+    #[cfg(unix)]
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|source| {
         SubscriptionError::Write {
             path: path.to_owned(),
@@ -779,11 +772,11 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), SubscriptionError> 
     ));
     let temp = PathBuf::from(temp);
     let write = (|| {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temp)?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temp)?;
         file.write_all(bytes)?;
         file.sync_all()
     })();
@@ -796,10 +789,25 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), SubscriptionError> 
         write_error(error)
     })?;
     if let Some(parent) = path.parent() {
-        fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(write_error)?;
+        sync_dir(parent)?;
     }
+    Ok(())
+}
+
+/// Flushes a directory entry after a create/rename/remove. Directory handles are
+/// not openable on Windows, where NTFS already orders the metadata write.
+#[cfg(unix)]
+fn sync_dir(path: &Path) -> Result<(), SubscriptionError> {
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| SubscriptionError::Write {
+            path: path.to_owned(),
+            source,
+        })
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_path: &Path) -> Result<(), SubscriptionError> {
     Ok(())
 }
 
