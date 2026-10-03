@@ -83,6 +83,25 @@ Detection takes a check interval plus probe time; active connections are not tra
 retried, and an outage affecting all candidates still requires recovery upstream.
 Use a representative destination with `--test-url` when availability differs by site.
 
+`clash-man auto --direct-fallback` explicitly permits the host's own connection as the last
+candidate when every proxy is unavailable. It exposes the host's IP and is off by default.
+The direct candidate shares health checks; recovered proxies take priority again. This setting
+persists through subscription updates. Run `auto` without the flag to remove it.
+
+`--http-fallback 127.0.0.1:17890` adds a host-owned loopback HTTP proxy after subscription
+nodes and before direct access. This can point to an SSH relay through another machine's
+working proxy. Both optional fallbacks use the same periodic health checks.
+
+For that relay, install `systemd/clash-man-relay-bridge.service` as a user service on the
+receiving host (requires `socat`), and `systemd/clash-man-relay@.service` on the machine with
+the working proxy. Set `CLASH_RELAY_SOCKET=/run/user/REMOTE_UID/clash-man-relay/upstream.sock`
+in the latter machine's `~/.config/clash-man/relay-SSH_HOST.env`, then enable the bridge and
+`clash-man-relay@SSH_HOST.service`. Use an existing SSH host alias with unattended key access.
+The remote Unix socket is private and the bridge listens only on loopback, including on SSH
+servers whose `GatewayPorts` setting would expose TCP reverse forwards. The relay depends on
+the sending machine being online. Its unit reconnects automatically; concurrent bridge clients
+are capped at 32, with bounded memory, descriptors, tasks and journal output.
+
 Beside the canonical `config.yaml`, the manager creates a private `config.yaml.clash-man/`
 directory containing `routing.json`, `source.yaml`, `nodes.yaml`, and an ignore-all `.gitignore`.
 Locks, recovery journals and scheduling state live there too, independent of `XDG_STATE_HOME`.

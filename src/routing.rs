@@ -9,6 +9,8 @@ use serde_json::json;
 use serde_yaml_ng::{Mapping, Value};
 
 const PROVIDER: &str = "clash-man-nodes";
+const DIRECT_FALLBACK: &str = "clash-man-direct-fallback";
+const HTTP_FALLBACK: &str = "clash-man-http-fallback";
 pub const DEFAULT_TEST_URL: &str = "https://www.gstatic.com/generate_204";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -19,6 +21,10 @@ pub struct AutoPolicy {
     pub preferred: Vec<String>,
     pub interval_seconds: u64,
     pub test_url: String,
+    #[serde(default)]
+    pub direct_fallback: bool,
+    #[serde(default)]
+    pub http_fallback: Option<std::net::SocketAddr>,
 }
 
 impl AutoPolicy {
@@ -27,6 +33,12 @@ impl AutoPolicy {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if self
+            .http_fallback
+            .is_some_and(|address| !address.ip().is_loopback() || address.port() == 0)
+        {
+            return Err("HTTP fallback must be a loopback address with a nonzero port".into());
+        }
         if self.group.trim().is_empty() || self.group == "GLOBAL" {
             return Err("choose a named routing group other than GLOBAL".into());
         }
@@ -92,6 +104,13 @@ pub fn render(
     };
     policy.validate()?;
     let mut root = mapping(source)?;
+    if policy.http_fallback.is_some_and(|address| {
+        ["port", "mixed-port", "socks-port"]
+            .iter()
+            .any(|key| root.get(*key).and_then(Value::as_u64) == Some(u64::from(address.port())))
+    }) {
+        return Err("HTTP fallback must not point to this core's own proxy listener".into());
+    }
     let mut nodes = root
         .get("proxies")
         .and_then(Value::as_sequence)
@@ -159,7 +178,7 @@ pub fn render(
                 policy.group
             )
         })?;
-    let pool = string_list(groups[target].get("proxies"))?;
+    let mut pool = string_list(groups[target].get("proxies"))?;
     if groups[target].get("use").is_some() || groups[target].get("filter").is_some() {
         return Err(
             "automatic routing does not support a target group mixing inline nodes and providers"
@@ -182,6 +201,30 @@ pub fn render(
             .copied()
             .unwrap_or(usize::MAX)
     });
+    let mut fallbacks = Vec::new();
+    if let Some(address) = policy.http_fallback {
+        fallbacks.push(value(json!({"name": HTTP_FALLBACK, "type": "http",
+                                   "server": address.ip().to_string(), "port": address.port()})));
+    }
+    if policy.direct_fallback {
+        fallbacks.push(value(json!({"name": DIRECT_FALLBACK, "type": "direct"})));
+    }
+    for fallback in fallbacks {
+        let name = fallback["name"]
+            .as_str()
+            .expect("generated fallback has a name");
+        if names.contains(name)
+            || groups
+                .iter()
+                .any(|group| group.get("name").and_then(Value::as_str) == Some(name))
+        {
+            return Err(format!("subscription uses reserved name {name}"));
+        }
+        // Append host-owned fallbacks after subscription nodes, relay before
+        // direct. Static group members would precede provider nodes instead.
+        pool.push(name.to_owned());
+        nodes.push(fallback);
+    }
     let mut providers = match root.get("proxy-providers") {
         None | Some(Value::Null) => Mapping::new(),
         Some(value) => value
@@ -339,6 +382,8 @@ mod tests {
             preferred: vec!["JP+02".into()],
             interval_seconds: 30,
             test_url: DEFAULT_TEST_URL.into(),
+            direct_fallback: false,
+            http_fallback: None,
         }
     }
 
@@ -395,6 +440,40 @@ mod tests {
     }
 
     #[test]
+    fn direct_fallback_is_opt_in_last_and_only_in_managed_group() {
+        let mut p = policy();
+        let mut old = serde_json::to_value(&p).unwrap();
+        old.as_object_mut().unwrap().remove("direct_fallback");
+        assert!(
+            !serde_json::from_value::<AutoPolicy>(old)
+                .unwrap()
+                .direct_fallback
+        );
+        p.direct_fallback = true;
+        p.preferred.insert(0, DIRECT_FALLBACK.into());
+        let output = render(SOURCE, Some(&p), Path::new("nodes.yaml")).unwrap();
+        let nodes = mapping(output.provider.as_ref().unwrap()).unwrap();
+        let nodes = nodes["proxies"].as_sequence().unwrap();
+        assert_eq!(nodes.last().unwrap()["name"], DIRECT_FALLBACK);
+        assert_eq!(nodes.last().unwrap()["type"], "direct");
+        let config = mapping(&output.config).unwrap();
+        assert!(
+            config["proxy-groups"][1]["filter"]
+                .as_str()
+                .unwrap()
+                .contains(DIRECT_FALLBACK)
+        );
+        assert!(
+            !config["proxy-groups"][2]["filter"]
+                .as_str()
+                .unwrap()
+                .contains(DIRECT_FALLBACK)
+        );
+        let conflict = SOURCE.replace("US.01", DIRECT_FALLBACK);
+        assert!(render(&conflict, Some(&p), Path::new("nodes.yaml")).is_err());
+    }
+
+    #[test]
     fn shared_health_interval_does_not_depend_on_group_registration_order() {
         let source = SOURCE.replace(
             "proxy-groups:\n",
@@ -408,6 +487,24 @@ mod tests {
                 assert_eq!(group["url"], DEFAULT_TEST_URL);
                 assert!(group.get("expected-status").is_none());
             }
+        }
+    }
+
+    #[test]
+    fn loopback_relay_precedes_direct_and_rejects_external_addresses() {
+        let mut p = policy();
+        p.direct_fallback = true;
+        p.http_fallback = Some("127.0.0.1:17890".parse().unwrap());
+        let output = render(SOURCE, Some(&p), Path::new("nodes.yaml")).unwrap();
+        let nodes = mapping(output.provider.as_ref().unwrap()).unwrap();
+        assert_eq!(nodes["proxies"][2]["name"], HTTP_FALLBACK);
+        assert_eq!(nodes["proxies"][2]["server"], "127.0.0.1");
+        assert_eq!(nodes["proxies"][3]["name"], DIRECT_FALLBACK);
+        let recursive = format!("port: 17890\n{SOURCE}");
+        assert!(render(&recursive, Some(&p), Path::new("nodes.yaml")).is_err());
+        for address in ["0.0.0.0:17890", "192.0.2.1:17890", "127.0.0.1:0"] {
+            p.http_fallback = Some(address.parse().unwrap());
+            assert!(p.validate().is_err());
         }
     }
 

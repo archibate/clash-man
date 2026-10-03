@@ -1,0 +1,23 @@
+[Unit]
+Description=Private Clash SSH relay to %I
+After=network-online.target clash.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+EnvironmentFile=%h/.config/clash-man/relay-%i.env
+ExecStartPre=/usr/bin/ssh -T -o BatchMode=yes -o ConnectTimeout=10 -o ControlMaster=no -o ControlPath=none -o LogLevel=ERROR -- %I /usr/bin/rm -f -- ${CLASH_RELAY_SOCKET}
+ExecStart=/usr/bin/ssh -NT -o BatchMode=yes -o ConnectTimeout=10 -o ControlMaster=no -o ControlPath=none -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o LogLevel=ERROR -R ${CLASH_RELAY_SOCKET}:127.0.0.1:7890 -- %I
+Restart=always
+RestartSec=10s
+TimeoutStartSec=20s
+TimeoutStopSec=5s
+NoNewPrivileges=yes
+TasksMax=16
+MemoryMax=64M
+LimitNOFILE=256
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=10
+
+[Install]
+WantedBy=default.target

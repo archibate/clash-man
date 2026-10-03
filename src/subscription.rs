@@ -1089,6 +1089,8 @@ mod tests {
             preferred: vec!["a".into()],
             interval_seconds: 30,
             test_url: routing::DEFAULT_TEST_URL.into(),
+            direct_fallback: false,
+            http_fallback: None,
         }
     }
 
@@ -1104,12 +1106,15 @@ mod tests {
     async fn automatic_policy_survives_subscription_and_can_be_disabled() {
         let fixture = fixture(Some(ROUTABLE)).await;
         mock_automatic(&fixture).await;
-        configure_auto(&fixture.settings, &fixture.client, auto_policy())
+        let mut policy = auto_policy();
+        policy.direct_fallback = true;
+        policy.http_fallback = Some("127.0.0.1:17890".parse().unwrap());
+        configure_auto(&fixture.settings, &fixture.client, policy.clone())
             .await
             .unwrap();
         assert_eq!(
             fixture.settings.routing_policy().unwrap(),
-            Some(auto_policy())
+            Some(policy.clone())
         );
         assert!(fixture.settings.provider_path().is_file());
         *fixture.mock.body.lock().await = "proxies: [{name: a, type: ss, password: new}]\nproxy-groups: [{name: Proxy, type: select, proxies: [a]}]\nrules: ['MATCH,Proxy']\n";
@@ -1121,6 +1126,9 @@ mod tests {
         );
         let nodes = fs::read_to_string(fixture.settings.provider_path()).unwrap();
         assert!(nodes.contains("password: new"));
+        assert!(nodes.contains("clash-man-direct-fallback"));
+        assert!(nodes.contains("clash-man-http-fallback"));
+        assert_eq!(fixture.settings.routing_policy().unwrap(), Some(policy));
         assert!(
             fs::read_to_string(&fixture.settings.config_path)
                 .unwrap()

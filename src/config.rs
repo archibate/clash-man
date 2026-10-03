@@ -63,6 +63,12 @@ pub enum CliCommand {
         /// URL used by the core to test node health.
         #[arg(long, default_value = crate::routing::DEFAULT_TEST_URL)]
         test_url: String,
+        /// Allow direct access only after every proxy candidate fails (exposes the host IP).
+        #[arg(long)]
+        direct_fallback: bool,
+        /// Use a loopback HTTP proxy after subscription nodes fail, before direct access.
+        #[arg(long)]
+        http_fallback: Option<std::net::SocketAddr>,
         /// Restore the subscription's manual routing groups.
         #[arg(long)]
         disable: bool,

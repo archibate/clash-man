@@ -103,7 +103,7 @@ def main():
     )
     origin = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Origin)
     threading.Thread(target=origin.serve_forever, daemon=True).start()
-    primary, backup = Proxy(origin.server_address), Proxy(origin.server_address)
+    primary, backup, relay = (Proxy(origin.server_address) for _ in range(3))
     controller_port, proxy_port = port(), port()
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     health_url = f"http://127.0.0.1:{origin.server_port}/check"
@@ -237,20 +237,21 @@ def main():
                 proxies = api("/providers/proxies/clash-man-nodes")["proxies"]
                 # Legacy Meta's global alive flag describes a different health
                 # store. The automatic group consumes URL-specific results.
-                histories = [node.get("extra", {}).get(health_url, []) for node in proxies]
+                histories = [
+                    node.get("extra", {}).get(health_url, []) for node in proxies
+                ]
                 return (
                     histories
-                    if all(history and history[-1]["delay"] > 0 for history in histories)
+                    if all(
+                        history and history[-1]["delay"] > 0 for history in histories
+                    )
                     else None
                 )
 
             first = eventually(histories)
             previous = first[0][-1]["time"]
             eventually(
-                lambda: (
-                    (nodes := histories())
-                    and nodes[0][-1]["time"] != previous
-                ),
+                lambda: (nodes := histories()) and nodes[0][-1]["time"] != previous,
                 seconds=12,
             )
             print("PASS: health checks advance with no business traffic", flush=True)
@@ -309,6 +310,60 @@ def main():
                 "PASS: periodic health replaces stale successful and failed manual tests",
                 flush=True,
             )
+            assert "clash-man-direct-fallback" not in api(group_path)["all"]
+            subprocess.run(
+                command
+                + [
+                    "--interval",
+                    "5s",
+                    "--test-url",
+                    health_url,
+                    "--direct-fallback",
+                    "--http-fallback",
+                    f"127.0.0.1:{relay.server_address[1]}",
+                ],
+                env=environment,
+                check=True,
+            )
+            assert api(group_path)["all"] == [
+                "pri`mary",
+                "backup",
+                "clash-man-http-fallback",
+                "clash-man-direct-fallback",
+            ]
+            eventually(lambda: api(group_path)["now"] == "pri`mary")
+            primary.fail()
+            backup.fail()
+            eventually(lambda: api(group_path)["now"] == "clash-man-http-fallback")
+            relay.fail()
+            eventually(lambda: api(group_path)["now"] == "clash-man-direct-fallback")
+            request = subprocess.run(
+                [
+                    "curl",
+                    "--noproxy",
+                    "",
+                    "--proxy",
+                    f"http://127.0.0.1:{proxy_port}",
+                    "-sS",
+                    "-o",
+                    "/dev/null",
+                    "-w",
+                    "%{http_code}",
+                    "--max-time",
+                    "5",
+                    health_url,
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            assert request.stdout == "204"
+            primary = Proxy(origin.server_address, primary_port)
+            eventually(lambda: api(group_path)["now"] == "pri`mary")
+            print(
+                "PASS: failed nodes use relay, failed relay uses direct, recovered proxy takes priority",
+                flush=True,
+            )
             subprocess.run(command + ["--disable"], env=environment, check=True)
             assert api("/proxies/Proxy")["all"] == ["pri`mary", "backup"]
             print(
@@ -318,6 +373,7 @@ def main():
         finally:
             primary.fail()
             backup.fail()
+            relay.fail()
             origin.shutdown()
             origin.server_close()
             process.terminate()

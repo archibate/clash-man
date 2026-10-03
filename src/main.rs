@@ -42,6 +42,8 @@ async fn main() -> Result<()> {
             preferred,
             interval,
             test_url,
+            direct_fallback,
+            http_fallback,
             disable,
         }) => {
             let policy = AutoPolicy {
@@ -50,6 +52,8 @@ async fn main() -> Result<()> {
                 preferred,
                 interval_seconds: interval.as_secs(),
                 test_url,
+                direct_fallback,
+                http_fallback,
             };
             subscription::configure_auto(&subscription, &client, policy)
                 .await

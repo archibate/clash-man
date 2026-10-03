@@ -1,0 +1,22 @@
+[Unit]
+Description=Loopback bridge for a private Clash SSH relay
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=/usr/bin/socat TCP4-LISTEN:17890,bind=127.0.0.1,reuseaddr,fork,max-children=32 UNIX-CONNECT:%t/clash-man-relay/upstream.sock
+RuntimeDirectory=clash-man-relay
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+UMask=0077
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=5s
+NoNewPrivileges=yes
+TasksMax=64
+MemoryMax=64M
+LimitNOFILE=256
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=10
+
+[Install]
+WantedBy=default.target
