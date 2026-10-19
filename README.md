@@ -118,8 +118,22 @@ Interrupted updates keep a durable undo journal. `clash-man recover` restores it
 systemd update service runs recovery automatically when its update process exits. The dashboard
 waits for active updates before exiting. Lost reload responses are failures, not offline success.
 
-Subscriptions can change routing sections only; listener, DNS, authentication and other host
-settings remain local. Subscription/controller bodies are limited to 8 MiB, stream lines to
+Subscriptions update routing and DNS resolver fields (`nameserver`, `default-nameserver`,
+`fallback`, `fallback-filter`, `nameserver-policy`, `proxy-server-nameserver`,
+`proxy-server-nameserver-policy`, `direct-nameserver`, `direct-nameserver-follow-policy`).
+When a DNS section is supplied, omitted resolver fields are removed, so an obsolete fallback
+cannot survive a provider's DNS change. A subscription without a DNS section keeps the current
+DNS settings. Listeners, authentication, DNS enable/listen, fake-IP mode and other host settings
+remain local. Changing only the automatic routing policy does not reapply DNS from a saved source.
+
+An automatic update commits only after the selected node has a successful, URL-specific health
+result recorded after reload, followed by a successful request to that URL through the running
+HTTP/mixed proxy listener. Global `alive` and old history are insufficient. Both legacy Meta and
+current Mihomo health formats are supported. Verification requires an HTTP/mixed listener and
+aligned controller/updater clocks; failures restore the previous files and running configuration.
+This verifies the configured test URL, not every possible destination.
+
+Subscription/controller bodies are limited to 8 MiB, stream lines to
 64 KiB, retained logs to 4 MiB/2,000 entries, and individual log payloads to 16 KiB.
 
 Optional integration check with an installed core (isolated loopback fixtures):

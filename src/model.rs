@@ -17,6 +17,12 @@ pub struct ProxyPayload {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+pub struct ProxyProvider {
+    #[serde(default)]
+    pub proxies: Vec<ProxyInfo>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ProxyInfo {
     #[serde(default)]
     pub name: String,
@@ -28,9 +34,36 @@ pub struct ProxyInfo {
     pub all: Vec<String>,
     #[serde(default)]
     pub history: Vec<DelayHistory>,
+    #[serde(default)]
+    pub extra: BTreeMap<String, UrlHealth>,
     pub alive: Option<bool>,
     pub udp: Option<bool>,
     pub xudp: Option<bool>,
+}
+
+/// Legacy Meta exports a history array; current Mihomo wraps it with URL-specific alive.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum UrlHealth {
+    Legacy(Vec<DelayHistory>),
+    Current {
+        alive: bool,
+        history: Vec<DelayHistory>,
+    },
+}
+
+impl UrlHealth {
+    pub fn latest_success(&self) -> Option<&DelayHistory> {
+        let history = match self {
+            Self::Legacy(history)
+            | Self::Current {
+                alive: true,
+                history,
+            } => history,
+            Self::Current { alive: false, .. } => return None,
+        };
+        history.last().filter(|last| last.delay > 0)
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

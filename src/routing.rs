@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_yaml_ng::{Mapping, Value};
 
-const PROVIDER: &str = "clash-man-nodes";
+pub(crate) const PROVIDER: &str = "clash-man-nodes";
 const DIRECT_FALLBACK: &str = "clash-man-direct-fallback";
 const HTTP_FALLBACK: &str = "clash-man-http-fallback";
 pub const DEFAULT_TEST_URL: &str = "https://www.gstatic.com/generate_204";
@@ -61,15 +61,26 @@ pub struct Rendered {
     pub provider: Option<String>,
 }
 
-/// Keep machine-local access and network settings out of the subscription's control.
-pub fn preserve_host_settings(source: &str, current: Option<&str>) -> Result<String, String> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ConfigSource {
+    Subscription,
+    SavedRouting,
+}
+
+/// Protect host access settings, while letting fresh subscriptions maintain their resolvers.
+pub fn preserve_host_settings(
+    source: &str,
+    current: Option<&str>,
+    origin: ConfigSource,
+) -> Result<String, String> {
     let Some(current) = current else {
         return Ok(source.to_owned());
     };
     let incoming = mapping(source)?;
     let original = incoming.clone();
     let mut new = mapping(current)?;
-    // Subscriptions own routing only. New core settings remain host-owned by default.
+    // Routing and resolver data belong to the subscription. New top-level settings
+    // remain host-owned so a provider cannot create listeners or replace credentials.
     for key in [
         "proxies",
         "proxy-groups",
@@ -83,6 +94,39 @@ pub fn preserve_host_settings(source: &str, current: Option<&str>) -> Result<Str
         } else {
             new.remove(key);
         }
+    }
+    if origin == ConfigSource::Subscription
+        && let Some(incoming_dns) = incoming.get("dns").filter(|dns| !dns.is_null())
+    {
+        let incoming_dns = incoming_dns.as_mapping().ok_or("dns must be a mapping")?;
+        let mut dns = match new.get("dns").filter(|dns| !dns.is_null()) {
+            Some(dns) => dns
+                .as_mapping()
+                .ok_or("host dns must be a mapping")?
+                .clone(),
+            None => Mapping::new(),
+        };
+        // Replace the resolver policy as a set: an omitted fallback must not survive
+        // after the provider moves those resolvers into nameserver. DNS enable/listen,
+        // interception mode and fake-IP settings remain controlled by the host.
+        for key in [
+            "nameserver",
+            "default-nameserver",
+            "fallback",
+            "fallback-filter",
+            "nameserver-policy",
+            "proxy-server-nameserver",
+            "proxy-server-nameserver-policy",
+            "direct-nameserver",
+            "direct-nameserver-follow-policy",
+        ] {
+            if let Some(value) = incoming_dns.get(key) {
+                dns.insert(key.into(), value.clone());
+            } else {
+                dns.remove(key);
+            }
+        }
+        new.insert("dns".into(), Value::Mapping(dns));
     }
     if new == original {
         Ok(source.to_owned())
@@ -390,13 +434,72 @@ mod tests {
     #[test]
     fn subscriptions_cannot_inject_host_settings() {
         let source = "proxies: []\nlisteners: [{type: http, port: 8080}]\ndns: {listen: '0.0.0.0:53'}\nfuture-core-listener: 9999\n";
-        let output =
-            preserve_host_settings(source, Some("port: 7890\ndns: {enable: false}\n")).unwrap();
+        let output = preserve_host_settings(
+            source,
+            Some("port: 7890\ndns: {enable: false}\n"),
+            ConfigSource::Subscription,
+        )
+        .unwrap();
         let config = mapping(&output).unwrap();
         assert!(!config.contains_key("listeners"));
         assert!(!config.contains_key("future-core-listener"));
         assert_eq!(config["dns"]["enable"], false);
         assert_eq!(config["port"], 7890);
+    }
+
+    #[test]
+    fn subscription_dns_replaces_stale_resolvers_without_changing_host_access() {
+        let output = preserve_host_settings(
+            "proxies: []\ndns:\n  nameserver: [https://new.example/dns-query]\n  listen: '0.0.0.0:53'\n  enable: false\n",
+            Some("port: 7890\ndns:\n  enable: true\n  listen: '127.0.0.1:1053'\n  enhanced-mode: fake-ip\n  nameserver: [119.29.29.29]\n  fallback: [https://old.example/dns-query]\n  fallback-filter: {geoip: true}\n"),
+            ConfigSource::Subscription,
+        ).unwrap();
+        let config = mapping(&output).unwrap();
+        assert_eq!(
+            config["dns"]["nameserver"],
+            value(json!(["https://new.example/dns-query"]))
+        );
+        assert!(config["dns"].get("fallback").is_none());
+        assert!(config["dns"].get("fallback-filter").is_none());
+        assert_eq!(config["dns"]["listen"], "127.0.0.1:1053");
+        assert_eq!(config["dns"]["enable"], true);
+        assert_eq!(config["dns"]["enhanced-mode"], "fake-ip");
+        assert_eq!(config["port"], 7890);
+    }
+
+    #[test]
+    fn routing_policy_changes_do_not_reapply_saved_dns() {
+        let current = "dns: {enable: true, nameserver: [https://current.example/dns-query]}\n";
+        let saved = "proxies: []\ndns: {nameserver: [https://old.example/dns-query]}\n";
+        let output =
+            preserve_host_settings(saved, Some(current), ConfigSource::SavedRouting).unwrap();
+        assert_eq!(
+            mapping(&output).unwrap()["dns"],
+            mapping(current).unwrap()["dns"]
+        );
+        let output =
+            preserve_host_settings("proxies: []\n", Some(current), ConfigSource::Subscription)
+                .unwrap();
+        assert_eq!(
+            mapping(&output).unwrap()["dns"],
+            mapping(current).unwrap()["dns"]
+        );
+    }
+
+    #[test]
+    fn subscription_replaces_resolver_policies_and_rejects_invalid_dns() {
+        let current = "dns: {enable: true, nameserver-policy: {'+.old.example': 1.1.1.1}, proxy-server-nameserver: [1.1.1.1]}\n";
+        let source = "proxies: []\ndns: {nameserver: [9.9.9.9], nameserver-policy: {'+.new.example': 9.9.9.9}}\n";
+        let output =
+            preserve_host_settings(source, Some(current), ConfigSource::Subscription).unwrap();
+        let dns = mapping(&output).unwrap()["dns"].clone();
+        assert!(dns.get("proxy-server-nameserver").is_none());
+        assert!(dns["nameserver-policy"].get("+.old.example").is_none());
+        assert_eq!(dns["nameserver-policy"]["+.new.example"], "9.9.9.9");
+        assert!(
+            preserve_host_settings("dns: invalid\n", Some(current), ConfigSource::Subscription)
+                .is_err()
+        );
     }
 
     #[test]
@@ -574,6 +677,7 @@ mod tests {
         let output = preserve_host_settings(
             "port: 9999\nsecret: other\nexternal-controller: 0.0.0.0:9090\nproxies: []\n",
             Some("port: 7890\nsecret: private\nmode: rule\nproxies: []\n"),
+            ConfigSource::Subscription,
         )
         .unwrap();
         let config = mapping(&output).unwrap();

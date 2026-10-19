@@ -10,11 +10,12 @@ use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
 use serde_yaml_ng::Value;
 use thiserror::Error;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
     api::{ApiError, ControllerClient},
     config::{Cli, ControllerSettings, config_home, state_home},
-    routing::{self, AutoPolicy},
+    routing::{self, AutoPolicy, ConfigSource},
     ui::human_bytes,
 };
 
@@ -64,6 +65,8 @@ pub enum SubscriptionError {
     Busy,
     #[error("routing policy: {0}")]
     Routing(String),
+    #[error("new configuration failed traffic verification: {0}")]
+    Verification(ApiError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -414,7 +417,14 @@ async fn fetch_and_apply(
     validate(&body)?;
 
     let policy = settings.routing_policy()?;
-    apply_configuration(settings, client, &body, policy.as_ref()).await
+    apply_configuration(
+        settings,
+        client,
+        &body,
+        policy.as_ref(),
+        ConfigSource::Subscription,
+    )
+    .await
 }
 
 /// Change policy without fetching a subscription or depending on an open dashboard.
@@ -453,7 +463,14 @@ pub async fn configure_auto(
         source,
     })?;
     validate(&source)?;
-    apply_configuration(settings, client, &source, Some(&policy)).await
+    apply_configuration(
+        settings,
+        client,
+        &source,
+        Some(&policy),
+        ConfigSource::SavedRouting,
+    )
+    .await
 }
 
 async fn apply_configuration(
@@ -461,6 +478,7 @@ async fn apply_configuration(
     client: &ControllerClient,
     source: &str,
     policy: Option<&AutoPolicy>,
+    origin: ConfigSource,
 ) -> Result<Outcome, SubscriptionError> {
     let config_path =
         fs::canonicalize(&settings.config_path).unwrap_or_else(|_| settings.config_path.clone());
@@ -474,11 +492,12 @@ async fn apply_configuration(
             });
         }
     };
-    let source = routing::preserve_host_settings(source, current.as_deref())
+    let source = routing::preserve_host_settings(source, current.as_deref(), origin)
         .map_err(SubscriptionError::Routing)?;
     let provider_path = settings.provider_path();
     let rendered =
         routing::render(&source, policy, &provider_path).map_err(SubscriptionError::Routing)?;
+    let authentication = proxy_authentication(&rendered.config)?;
     let mut changes = Vec::new();
     if let Some(provider) = rendered.provider {
         changes.push((settings.provider_path(), provider.into_bytes()));
@@ -554,11 +573,19 @@ async fn apply_configuration(
         }
         pending.reload = true;
         save_pending(settings, &pending)?;
+        let reloaded_after = OffsetDateTime::now_utc();
         match client.reload_config(&config_path).await {
             Ok(()) => {
                 restore_selections(client, &selected).await?;
                 if let Some(policy) = policy.filter(|policy| policy.enabled) {
-                    verify_automatic(client, policy).await?;
+                    verify_automatic(client, policy, reloaded_after).await?;
+                    let credentials = authentication
+                        .as_ref()
+                        .map(|(user, password)| (user.as_str(), password.as_str()));
+                    client
+                        .verify_proxy_traffic(&policy.test_url, credentials)
+                        .await
+                        .map_err(SubscriptionError::Verification)?;
                 }
                 Ok(Outcome::Reloaded)
             }
@@ -581,6 +608,7 @@ async fn apply_configuration(
 async fn verify_automatic(
     client: &ControllerClient,
     policy: &AutoPolicy,
+    reloaded_after: OffsetDateTime,
 ) -> Result<(), SubscriptionError> {
     let automatic = policy.automatic_group();
     let deadline = Instant::now() + Duration::from_secs(40);
@@ -600,20 +628,59 @@ async fn verify_automatic(
             ));
         }
         let selected = &payload.proxies[&automatic].now;
-        if payload
-            .proxies
-            .get(selected)
-            .is_some_and(|node| node.alive == Some(true) && !node.history.is_empty())
-        {
+        let provider = client
+            .proxy_provider(routing::PROVIDER)
+            .await
+            .map_err(SubscriptionError::Reload)?;
+        if provider.proxies.iter().any(|node| {
+            node.name == *selected && fresh_health(node, &policy.test_url, reloaded_after)
+        }) {
             return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(SubscriptionError::Routing(
-                "no automatically selected node passed the native health check within 40s".into(),
+                "no selected node has a successful post-reload check for the policy URL within 40s"
+                    .into(),
             ));
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+}
+
+fn fresh_health(node: &crate::model::ProxyInfo, url: &str, since: OffsetDateTime) -> bool {
+    node.extra
+        .get(url)
+        .and_then(|health| health.latest_success())
+        .is_some_and(|last| {
+            OffsetDateTime::parse(&last.time, &Rfc3339)
+                .is_ok_and(|time| time >= since && time <= OffsetDateTime::now_utc())
+        })
+}
+
+fn proxy_authentication(config: &str) -> Result<Option<(String, String)>, SubscriptionError> {
+    let config: Value = serde_yaml_ng::from_str(config)
+        .map_err(|_| SubscriptionError::Invalid("invalid rendered config".into()))?;
+    let Some(authentication) = config
+        .get("authentication")
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(None);
+    };
+    let values = authentication
+        .as_sequence()
+        .ok_or_else(|| SubscriptionError::Invalid("proxy authentication must be a list".into()))?;
+    values
+        .first()
+        .map(|value| {
+            value
+                .as_str()
+                .and_then(|value| value.split_once(':'))
+                .map(|(user, password)| (user.to_owned(), password.to_owned()))
+                .ok_or_else(|| {
+                    SubscriptionError::Invalid("proxy authentication must use user:password".into())
+                })
+        })
+        .transpose()
 }
 
 async fn restore_selections(
@@ -842,6 +909,15 @@ mod tests {
     const CONFIG_V1_RESTAMPED: &str =
         "# updated 2\nproxies:\n  - {name: a, type: ss}\nproxy-groups: []\n";
     const CONFIG_V2: &str = "proxies:\n  - {name: b, type: ss}\n";
+    const TEST_URL: &str = "http://health.invalid/check";
+
+    type ObservedRequests = Vec<(String, Option<String>)>;
+
+    #[derive(Clone)]
+    struct TrafficMock {
+        status: Arc<Mutex<StatusCode>>,
+        requests: Arc<Mutex<ObservedRequests>>,
+    }
 
     #[derive(Clone)]
     struct Mock {
@@ -850,6 +926,9 @@ mod tests {
         reloads: Arc<Mutex<Vec<JsonValue>>>,
         proxies: Arc<Mutex<JsonValue>>,
         selection_failures: Arc<Mutex<u32>>,
+        provider: Arc<Mutex<JsonValue>>,
+        proxy_port: u16,
+        traffic: TrafficMock,
     }
 
     async fn serve(router: Router) -> String {
@@ -867,12 +946,38 @@ mod tests {
     }
 
     async fn fixture(initial_config: Option<&str>) -> Fixture {
+        let traffic = TrafficMock {
+            status: Arc::new(Mutex::new(StatusCode::NO_CONTENT)),
+            requests: Arc::default(),
+        };
+        let proxy = serve(
+            Router::new()
+                .fallback(get(
+                    |axum::extract::State(traffic): axum::extract::State<TrafficMock>,
+                     request: axum::extract::Request| async move {
+                        traffic.requests.lock().await.push((
+                            request.uri().to_string(),
+                            request
+                                .headers()
+                                .get("proxy-authorization")
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::to_owned),
+                        ));
+                        *traffic.status.lock().await
+                    },
+                ))
+                .with_state(traffic.clone()),
+        )
+        .await;
         let mock = Mock {
             body: Arc::new(Mutex::new(CONFIG_V1)),
             reload_status: Arc::new(Mutex::new(StatusCode::NO_CONTENT)),
             reloads: Arc::default(),
             proxies: Arc::new(Mutex::new(json!({"proxies": {}}))),
             selection_failures: Arc::default(),
+            provider: Arc::new(Mutex::new(json!({"proxies": []}))),
+            proxy_port: url::Url::parse(&proxy).unwrap().port().unwrap(),
+            traffic,
         };
         let router = Router::new()
             .route(
@@ -884,6 +989,14 @@ mod tests {
                 get(
                     |axum::extract::State(mock): axum::extract::State<Mock>| async move {
                         Json(mock.proxies.lock().await.clone())
+                    },
+                ),
+            )
+            .route(
+                "/providers/proxies/clash-man-nodes",
+                get(
+                    |axum::extract::State(mock): axum::extract::State<Mock>| async move {
+                        Json(mock.provider.lock().await.clone())
                     },
                 ),
             )
@@ -918,11 +1031,31 @@ mod tests {
             )
             .route(
                 "/configs",
-                put(
+                get(
+                    |axum::extract::State(mock): axum::extract::State<Mock>| async move {
+                        Json(json!({"port": mock.proxy_port}))
+                    },
+                )
+                .put(
                     |axum::extract::State(mock): axum::extract::State<Mock>,
                      Json(payload): Json<JsonValue>| async move {
                         mock.reloads.lock().await.push(payload);
                         let status = *mock.reload_status.lock().await;
+                        if status == StatusCode::NO_CONTENT {
+                            let mut provider = mock.provider.lock().await;
+                            if let Some(proxies) = provider["proxies"].as_array_mut() {
+                                for node in proxies {
+                                    if let Some(history) = node["extra"][TEST_URL].as_array_mut() {
+                                        for sample in history {
+                                            sample["time"] = OffsetDateTime::now_utc()
+                                                .format(&Rfc3339)
+                                                .unwrap()
+                                                .into();
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         (status, Json(json!({ "message": "bad config" }))).into_response()
                     },
                 ),
@@ -1088,7 +1221,7 @@ mod tests {
             group: "Proxy".into(),
             preferred: vec!["a".into()],
             interval_seconds: 30,
-            test_url: routing::DEFAULT_TEST_URL.into(),
+            test_url: TEST_URL.into(),
             direct_fallback: false,
             http_fallback: None,
         }
@@ -1100,6 +1233,112 @@ mod tests {
             "Proxy Auto": {"type":"Fallback","now":"a","all":["a"]},
             "a": {"type":"Shadowsocks","alive":true,"history":[{"delay":50}]}
         }});
+        *fixture.mock.provider.lock().await = json!({"proxies": [{
+            "name": "a", "extra": {TEST_URL: [{"time": "2000-01-01T00:00:00Z", "delay": 50}]}
+        }]});
+    }
+
+    #[tokio::test]
+    async fn automatic_verification_does_not_accept_only_global_health() {
+        let fixture = fixture(Some(ROUTABLE)).await;
+        mock_automatic(&fixture).await;
+        // A global success says nothing about the current policy URL or reload.
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            verify_automatic(&fixture.client, &auto_policy(), OffsetDateTime::now_utc()),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "verification must wait for fresh URL-specific health: {result:?}"
+        );
+    }
+
+    #[test]
+    fn health_must_match_url_reload_time_and_latest_outcome() {
+        let since = OffsetDateTime::now_utc() - time::Duration::seconds(2);
+        let fresh = (since + time::Duration::seconds(1))
+            .format(&Rfc3339)
+            .unwrap();
+        let old = (since - time::Duration::seconds(1))
+            .format(&Rfc3339)
+            .unwrap();
+        let future = (since + time::Duration::hours(1)).format(&Rfc3339).unwrap();
+        let cases = [
+            (json!({TEST_URL: [{"time":fresh, "delay":50}]}), true),
+            (
+                json!({TEST_URL: {"alive":true,"history":[{"time":fresh,"delay":50}]}}),
+                true,
+            ),
+            (
+                json!({TEST_URL: {"alive":false,"history":[{"time":fresh,"delay":50}]}}),
+                false,
+            ),
+            (json!({TEST_URL: [{"time":old, "delay":50}]}), false),
+            (
+                json!({"http://wrong.invalid/": [{"time":fresh, "delay":50}]}),
+                false,
+            ),
+            (
+                json!({TEST_URL: [{"time":fresh, "delay":50},{"time":fresh,"delay":0}]}),
+                false,
+            ),
+            (json!({TEST_URL: [{"time":future, "delay":50}]}), false),
+            (json!({TEST_URL: [{"time":"invalid", "delay":50}]}), false),
+            (json!({}), false),
+        ];
+        for (extra, expected) in cases {
+            let node = serde_json::from_value(
+                json!({"alive":true,"history":[{"delay":50}],"extra":extra}),
+            )
+            .unwrap();
+            assert_eq!(fresh_health(&node, TEST_URL, since), expected, "{extra}");
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_proxy_traffic_restores_every_file_despite_fresh_native_health() {
+        let fixture = fixture(Some(ROUTABLE)).await;
+        mock_automatic(&fixture).await;
+        *fixture.mock.traffic.status.lock().await = StatusCode::BAD_GATEWAY;
+        let error = configure_auto(&fixture.settings, &fixture.client, auto_policy())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SubscriptionError::Verification(_)));
+        assert_eq!(
+            fs::read_to_string(&fixture.settings.config_path).unwrap(),
+            ROUTABLE
+        );
+        assert!(!fixture.settings.provider_path().exists());
+        assert!(!fixture.settings.source_path().exists());
+        assert!(!fixture.settings.routing_path().exists());
+        assert!(!fixture.settings.state_dir.join("pending.json").exists());
+        assert_eq!(fixture.mock.reloads.lock().await.len(), 2);
+        assert_eq!(fixture.mock.traffic.requests.lock().await[0].0, TEST_URL);
+    }
+
+    #[tokio::test]
+    async fn proxy_verification_uses_listener_and_auth_and_rejects_redirects() {
+        let fixture = fixture(Some(ROUTABLE)).await;
+        fixture
+            .client
+            .verify_proxy_traffic(TEST_URL, Some(("user", "pass")))
+            .await
+            .unwrap();
+        let requests = fixture.mock.traffic.requests.lock().await;
+        assert_eq!(
+            requests[0],
+            (TEST_URL.to_owned(), Some("Basic dXNlcjpwYXNz".into()))
+        );
+        drop(requests);
+        *fixture.mock.traffic.status.lock().await = StatusCode::FOUND;
+        assert!(
+            fixture
+                .client
+                .verify_proxy_traffic(TEST_URL, None)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

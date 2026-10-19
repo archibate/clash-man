@@ -10,6 +10,7 @@ import pathlib
 import select
 import socket
 import socketserver
+import struct
 import subprocess
 import tempfile
 import threading
@@ -23,6 +24,13 @@ import yaml
 
 class Origin(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path == "/sub":
+            body = self.server.subscription.encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         self.send_response(204)
         self.send_header("Connection", "close")
         self.end_headers()
@@ -31,6 +39,29 @@ class Origin(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, *args):
         pass
+
+
+class DnsAnswer(socketserver.BaseRequestHandler):
+    def handle(self):
+        data, connection = self.request
+        end = 12
+        while data[end]:
+            end += data[end] + 1
+        end += 5  # terminating label, question type and class
+        is_a = data[end - 4 : end - 2] == b"\x00\x01"
+        answer = data[:2] + struct.pack("!5H", 0x8180, 1, int(is_a), 0, 0)
+        answer += data[12:end]
+        if is_a:
+            answer += b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 1, 4)
+            answer += socket.inet_aton(self.server.answer)
+        connection.sendto(answer, self.client_address)
+
+
+def dns_server(answer):
+    server = socketserver.UDPServer(("127.0.0.1", 0), DnsAnswer)
+    server.answer = answer
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
 
 
 class Tunnel(socketserver.BaseRequestHandler):
@@ -104,6 +135,7 @@ def main():
     origin = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Origin)
     threading.Thread(target=origin.serve_forever, daemon=True).start()
     primary, backup, relay = (Proxy(origin.server_address) for _ in range(3))
+    old_dns, new_dns = (dns_server(ip) for ip in ["203.0.113.10", "203.0.113.20"])
     controller_port, proxy_port = port(), port()
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     health_url = f"http://127.0.0.1:{origin.server_port}/check"
@@ -134,6 +166,13 @@ def main():
                     "secret": "integration-test",
                     "mode": "rule",
                     "log-level": "silent",
+                    "dns": {
+                        "enable": True,
+                        "enhanced-mode": "redir-host",
+                        "nameserver": [f"127.0.0.1:{old_dns.server_address[1]}"],
+                        "fallback": [f"127.0.0.1:{old_dns.server_address[1]}"],
+                        "fallback-filter": {"geoip": False, "ipcidr": ["0.0.0.0/32"]},
+                    },
                     "proxies": [
                         {
                             "name": "pri`mary",
@@ -181,6 +220,7 @@ def main():
         try:
             eventually(lambda: api("/version"))
             saved = config.read_bytes()
+            subscription = yaml.safe_load(saved)
             journal = directory / "config.yaml.clash-man/pending.json"
             journal.parent.mkdir(parents=True)
             journal.write_text(
@@ -262,6 +302,52 @@ def main():
             except urllib.error.HTTPError as error:
                 assert error.code == 400
             print("PASS: legacy manual switch cannot replace Auto", flush=True)
+
+            def dns_answer(name):
+                query = urllib.parse.urlencode({"name": name, "type": "A"})
+                return [x["data"] for x in api("/dns/query?" + query)["Answer"]]
+
+            assert dns_answer("before.invalid") == ["203.0.113.10"]
+            subscription["dns"] = {
+                "nameserver": [f"127.0.0.1:{new_dns.server_address[1]}"],
+                "listen": "0.0.0.0:53",
+                "enable": False,
+            }
+            origin.subscription = yaml.safe_dump(subscription)
+            (directory / "sublink.txt").write_text(
+                f"http://127.0.0.1:{origin.server_port}/sub\n"
+            )
+            update = [manager, "--config", str(config), "update", "--force"]
+            subprocess.run(update, env=environment, check=True)
+            live_dns = yaml.safe_load(config.read_text())["dns"]
+            assert live_dns["enable"] and "listen" not in live_dns
+            assert "fallback" not in live_dns and "fallback-filter" not in live_dns
+            assert dns_answer("after.invalid") == ["203.0.113.20"]
+            print(
+                "PASS: subscription replaces real DNS answers without exposing a DNS listener",
+                flush=True,
+            )
+
+            healthy_config = config.read_bytes()
+            # Native per-node checks remain healthy, but the actual proxy rule rejects
+            # all traffic. The update must roll back both routing and DNS at runtime.
+            subscription["rules"] = ["MATCH,REJECT"]
+            subscription["dns"]["nameserver"] = [
+                f"127.0.0.1:{old_dns.server_address[1]}"
+            ]
+            origin.subscription = yaml.safe_dump(subscription)
+            failed = subprocess.run(
+                update, env=environment, capture_output=True, text=True, check=False
+            )
+            assert failed.returncode != 0 and "traffic verification" in failed.stderr, (
+                failed.stderr
+            )
+            assert config.read_bytes() == healthy_config and not journal.exists()
+            assert dns_answer("rollback.invalid") == ["203.0.113.20"]
+            print(
+                "PASS: healthy nodes cannot hide broken proxy routing; failed update restores live DNS and rules",
+                flush=True,
+            )
             primary_delay = (
                 "/proxies/"
                 + urllib.parse.quote("pri`mary", safe="")
@@ -376,6 +462,9 @@ def main():
             relay.fail()
             origin.shutdown()
             origin.server_close()
+            for resolver in [old_dns, new_dns]:
+                resolver.shutdown()
+                resolver.server_close()
             process.terminate()
             try:
                 process.wait(timeout=5)

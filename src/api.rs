@@ -9,8 +9,8 @@ use url::Url;
 use crate::{
     config::ControllerSettings,
     model::{
-        ConnectionsPayload, LogEntry, MemorySample, ProxyPayload, RulesPayload, RuntimeConfig,
-        TrafficSample, VersionInfo,
+        ConnectionsPayload, LogEntry, MemorySample, ProxyPayload, ProxyProvider, RulesPayload,
+        RuntimeConfig, TrafficSample, VersionInfo,
     },
 };
 
@@ -72,6 +72,66 @@ impl ControllerClient {
 
     pub async fn proxies(&self) -> ApiResult<ProxyPayload> {
         self.get("proxies").await
+    }
+
+    pub async fn proxy_provider(&self, name: &str) -> ApiResult<ProxyProvider> {
+        let mut url = self.endpoint("providers/proxies")?;
+        url.path_segments_mut()
+            .map_err(|_| ApiError::Decode("controller URL cannot hold path segments".into()))?
+            .push(name);
+        self.get_url(url, REQUEST_TIMEOUT).await
+    }
+
+    /// Probe the running core's HTTP/mixed listener, without environment proxy bypasses.
+    pub async fn verify_proxy_traffic(
+        &self,
+        test_url: &str,
+        authentication: Option<(&str, &str)>,
+    ) -> ApiResult<()> {
+        let config = self.configs().await?;
+        let port = if config.port != 0 {
+            config.port
+        } else {
+            config.mixed_port
+        };
+        if port == 0 {
+            return Err(ApiError::Decode(
+                "traffic verification requires an HTTP or mixed proxy listener".into(),
+            ));
+        }
+        let mut address = self.base_url.clone();
+        address
+            .set_scheme("http")
+            .map_err(|_| ApiError::Decode("invalid proxy scheme".into()))?;
+        address
+            .set_port(Some(port))
+            .map_err(|_| ApiError::Decode("invalid proxy port".into()))?;
+        address.set_path("/");
+        address.set_query(None);
+        address.set_fragment(None);
+        address
+            .set_username("")
+            .map_err(|_| ApiError::Decode("invalid proxy address".into()))?;
+        address
+            .set_password(None)
+            .map_err(|_| ApiError::Decode("invalid proxy address".into()))?;
+        let mut proxy = reqwest::Proxy::all(address).map_err(transport_error)?;
+        if let Some((username, password)) = authentication {
+            proxy = proxy.basic_auth(username, password);
+        }
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .proxy(proxy)
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(transport_error)?;
+        let response = http.get(test_url).send().await.map_err(transport_error)?;
+        if !response.status().is_success() {
+            return Err(ApiError::Status(response.status()));
+        }
+        Ok(())
     }
 
     pub async fn connections(&self) -> ApiResult<ConnectionsPayload> {
